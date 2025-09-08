@@ -99,7 +99,7 @@ ports/rp2/build-<BOARD>/firmware.uf2
 
 Once the board reboots, connect to the serial port REPL and test with the examples below.
 
-### 🔹 W5100S/W5500 series (WIZNET6K)
+### 🔹 W5100S/W5500/W6100 series (WIZNET6K)
 ```python
 import network
 
@@ -121,7 +121,7 @@ nic.ifconfig("dhcp")
 print('ifconfig:', nic.ifconfig())
 ```
 
-### 🔹 W6100/W6300 series (WIZNET_PIO_SPI + WIZNET6K)
+### 🔹 W6300 series (WIZNET_PIO_SPI + WIZNET6K)
 ```python
 import network
 

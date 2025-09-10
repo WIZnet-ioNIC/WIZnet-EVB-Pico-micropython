@@ -113,6 +113,7 @@ print('ifconfig:', nic.ifconfig())
 ### 🔹 W55RP20 (WIZNET_PIO_SPI + WIZNET6K)
 ```python
 import network
+from machine import Pin,WIZNET_PIO_SPI
 
 spi = WIZNET_PIO_SPI(baudrate=10_000_000, sck=Pin(21), cs=Pin(20), mosi=Pin(23), miso=Pin(22))
 nic = network.WIZNET6K(spi, Pin(20), Pin(25))  # spi, cs, reset pin
@@ -124,6 +125,7 @@ print('ifconfig:', nic.ifconfig())
 ### 🔹 W6300 series (WIZNET_PIO_SPI + WIZNET6K)
 ```python
 import network
+from machine import Pin,WIZNET_PIO_SPI
 
 spi = WIZNET_PIO_SPI(
     baudrate=10_000_000,

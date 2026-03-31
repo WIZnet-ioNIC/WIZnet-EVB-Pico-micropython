@@ -163,6 +163,7 @@ typedef struct _wiznet6k_obj_t {
     wiz_NetInfo netinfo;
     uint8_t socket_used;
     bool active;
+    mp_uint_t socket_timeout_ms[_WIZCHIP_SOCK_NUM_];
     #endif
 } wiznet6k_obj_t;
 
@@ -170,6 +171,11 @@ typedef struct _wiznet6k_obj_t {
 #define IS_ACTIVE(self) (self->netif.flags & NETIF_FLAG_UP)
 #else // WIZNET6K_PROVIDED_STACK
 #define IS_ACTIVE(self) (self->active)
+#endif
+
+#if WIZNET6K_PROVIDED_STACK
+#define WIZNET6K_TIMEOUT_BLOCKING ((mp_uint_t)-1)
+#define WIZNET6K_KEEPALIVE_INTVL    (2)  // Keep-alive interval in 5s units (2 * 5s = 10s)
 #endif
 
 // Global object holding the Wiznet6k state
@@ -541,6 +547,7 @@ static int wiznet6k_socket_socket(mod_network_socket_obj_t *socket, int *_errno)
             if ((wiznet6k_obj.socket_used & (1 << sn)) == 0) {
                 wiznet6k_obj.socket_used |= (1 << sn);
                 socket->fileno = sn;
+                wiznet6k_obj.socket_timeout_ms[sn] = WIZNET6K_TIMEOUT_BLOCKING;
                 break;
             }
         }
@@ -596,8 +603,18 @@ static int wiznet6k_socket_listen(mod_network_socket_obj_t *socket, mp_int_t bac
 }
 
 static int wiznet6k_socket_accept(mod_network_socket_obj_t *socket, mod_network_socket_obj_t *socket2, byte *ip, mp_uint_t *port, int *_errno) {
+    // Read timeout setting for this socket
+    mp_uint_t timeout_ms = WIZNET6K_TIMEOUT_BLOCKING;
+    if (socket->fileno >= 0 && (mp_uint_t)socket->fileno < _WIZCHIP_SOCK_NUM_) {
+        timeout_ms = wiznet6k_obj.socket_timeout_ms[socket->fileno];
+    }
+
+    mp_uint_t start = mp_hal_ticks_ms();
+
     for (;;) {
-        int sr = getSn_SR((uint8_t)socket->fileno);
+        uint8_t sn = (uint8_t)socket->fileno;
+        int sr = getSn_SR(sn);
+
         if (sr == SOCK_ESTABLISHED) {
             socket2->domain = socket->domain;
             socket2->type = socket->type;
@@ -611,7 +628,6 @@ static int wiznet6k_socket_accept(mod_network_socket_obj_t *socket, mod_network_
 
             // WIZnet turns the listening socket into the client socket, so we
             // need to re-bind and re-listen on another socket for the server.
-            // TODO handle errors, especially no-more-sockets error
             socket->domain = MOD_NETWORK_AF_INET;
             socket->fileno = -1;
             int _errno2;
@@ -625,11 +641,28 @@ static int wiznet6k_socket_accept(mod_network_socket_obj_t *socket, mod_network_
 
             return 0;
         }
+
+        // Listening socket closed unexpectedly
         if (sr == SOCK_CLOSED || sr == SOCK_CLOSE_WAIT) {
             wiznet6k_socket_close(socket);
-            *_errno = MP_ENOTCONN; // ??
+            *_errno = MP_ENOTCONN;
             return -1;
         }
+
+        // Non-blocking: return immediately
+        if (timeout_ms == 0) {
+            *_errno = MP_EAGAIN;
+            return -1;
+        }
+
+        // Software timeout check
+        if (timeout_ms != WIZNET6K_TIMEOUT_BLOCKING) {
+            if (mp_hal_ticks_ms() - start >= timeout_ms) {
+                *_errno = MP_ETIMEDOUT;
+                return -1;
+            }
+        }
+
         mp_hal_delay_ms(1);
     }
 }
@@ -656,11 +689,53 @@ static int wiznet6k_socket_connect(mod_network_socket_obj_t *socket, byte *ip, m
 }
 
 static mp_uint_t wiznet6k_socket_send(mod_network_socket_obj_t *socket, const byte *buf, mp_uint_t len, int *_errno) {
+    mp_uint_t timeout_ms = WIZNET6K_TIMEOUT_BLOCKING;
+    if (socket->fileno >= 0 && (mp_uint_t)socket->fileno < _WIZCHIP_SOCK_NUM_) {
+        timeout_ms = wiznet6k_obj.socket_timeout_ms[socket->fileno];
+    }
+
+    mp_uint_t start = mp_hal_ticks_ms();
+    uint8_t sn = (uint8_t)socket->fileno;
+
+    // Wait until TX buffer has at least some space
+    for (;;) {
+        uint16_t tx_free = getSn_TX_FSR(sn);
+
+        if (tx_free > 0) {
+            // Clamp len to available TX buffer space
+            if (len > tx_free) {
+                len = tx_free;
+            }
+            break;
+        }
+
+        uint8_t sr = getSn_SR(sn);
+
+        if (sr == SOCK_CLOSED || sr == SOCK_CLOSE_WAIT) {
+            wiznet6k_socket_close(socket);
+            *_errno = MP_ENOTCONN;
+            return -1;
+        }
+
+        if (timeout_ms == 0) {
+            *_errno = MP_EAGAIN;
+            return -1;
+        }
+
+        if (timeout_ms != WIZNET6K_TIMEOUT_BLOCKING) {
+            if (mp_hal_ticks_ms() - start >= timeout_ms) {
+                *_errno = MP_ETIMEDOUT;
+                return -1;
+            }
+        }
+
+        mp_hal_delay_ms(1);
+    }
+
     MP_THREAD_GIL_EXIT();
-    mp_int_t ret = wizchip_send(socket->fileno, (byte *)buf, len);
+    mp_int_t ret = wizchip_send(sn, (byte *)buf, len);
     MP_THREAD_GIL_ENTER();
 
-    // TODO convert Wiz errno's to POSIX ones
     if (ret < 0) {
         wiznet6k_socket_close(socket);
         *_errno = -ret;
@@ -670,29 +745,118 @@ static mp_uint_t wiznet6k_socket_send(mod_network_socket_obj_t *socket, const by
 }
 
 static mp_uint_t wiznet6k_socket_recv(mod_network_socket_obj_t *socket, byte *buf, mp_uint_t len, int *_errno) {
-    MP_THREAD_GIL_EXIT();
-    mp_int_t ret = wizchip_recv(socket->fileno, buf, len);
-    MP_THREAD_GIL_ENTER();
-
-    // TODO convert Wiz errno's to POSIX ones
-    if (ret < 0) {
-        wiznet6k_socket_close(socket);
-        *_errno = -ret;
-        return -1;
+    mp_uint_t timeout_ms = WIZNET6K_TIMEOUT_BLOCKING;
+    if (socket->fileno >= 0 && (mp_uint_t)socket->fileno < _WIZCHIP_SOCK_NUM_) {
+        timeout_ms = wiznet6k_obj.socket_timeout_ms[socket->fileno];
     }
-    return ret;
+
+    mp_uint_t start = mp_hal_ticks_ms();
+
+    for (;;) {
+        uint8_t sn = (uint8_t)socket->fileno;
+        uint8_t sr = getSn_SR(sn);
+        uint16_t rx_size = getSn_RX_RSR(sn);
+
+        if ((sr == SOCK_CLOSED || sr == SOCK_CLOSE_WAIT) && rx_size == 0) {
+            wiznet6k_socket_close(socket);
+            *_errno = MP_ENOTCONN;
+            return MP_STREAM_ERROR;
+        }
+
+        if (rx_size > 0) {
+            MP_THREAD_GIL_EXIT();
+            mp_int_t ret = wizchip_recv(sn, buf, len);
+            MP_THREAD_GIL_ENTER();
+
+            if (ret > 0) {
+                return ret;
+            }
+
+            if (ret == 0) {
+                if (timeout_ms == 0) {
+                    *_errno = MP_EAGAIN;
+                    return MP_STREAM_ERROR;
+                }
+                if (timeout_ms != WIZNET6K_TIMEOUT_BLOCKING &&
+                    mp_hal_ticks_ms() - start >= timeout_ms) {
+                    *_errno = MP_ETIMEDOUT;
+                    return MP_STREAM_ERROR;
+                }
+                mp_hal_delay_ms(1);
+                continue;
+            }
+
+            if (ret == SOCKERR_TIMEOUT) {
+                *_errno = MP_ETIMEDOUT;
+                return MP_STREAM_ERROR;
+            }
+
+            if (ret == SOCKERR_SOCKSTATUS) {
+                wiznet6k_socket_close(socket);
+                *_errno = MP_ENOTCONN;
+                return MP_STREAM_ERROR;
+            }
+
+            wiznet6k_socket_close(socket);
+            *_errno = -ret;
+            return MP_STREAM_ERROR;
+        }
+
+        if (timeout_ms == 0) {
+            *_errno = MP_EAGAIN;
+            return MP_STREAM_ERROR;
+        }
+
+        if (timeout_ms != WIZNET6K_TIMEOUT_BLOCKING &&
+            mp_hal_ticks_ms() - start >= timeout_ms) {
+            *_errno = MP_ETIMEDOUT;
+            return MP_STREAM_ERROR;
+        }
+
+        mp_hal_delay_ms(1);
+    }
 }
 
 static mp_uint_t wiznet6k_socket_sendto(mod_network_socket_obj_t *socket, const byte *buf, mp_uint_t len, byte *ip, mp_uint_t port, int *_errno) {
     if (socket->domain == 0) {
-        // socket not opened; use "bind" function to open the socket in client mode
         if (wiznet6k_socket_bind(socket, ip, 0, _errno) != 0) {
             return -1;
         }
     }
 
+    mp_uint_t timeout_ms = WIZNET6K_TIMEOUT_BLOCKING;
+    if (socket->fileno >= 0 && (mp_uint_t)socket->fileno < _WIZCHIP_SOCK_NUM_) {
+        timeout_ms = wiznet6k_obj.socket_timeout_ms[socket->fileno];
+    }
+
+    mp_uint_t start = mp_hal_ticks_ms();
+    uint8_t sn = (uint8_t)socket->fileno;
+
+    // Wait until TX buffer has enough space
+    for (;;) {
+        uint16_t tx_free = getSn_TX_FSR(sn);
+
+        if (tx_free >= len) {
+            break;
+        }
+
+        if (timeout_ms == 0) {
+            *_errno = MP_EAGAIN;
+            return -1;
+        }
+
+        if (timeout_ms != WIZNET6K_TIMEOUT_BLOCKING) {
+            if (mp_hal_ticks_ms() - start >= timeout_ms) {
+                *_errno = MP_ETIMEDOUT;
+                return -1;
+            }
+        }
+
+        mp_hal_delay_ms(1);
+    }
+
     MP_THREAD_GIL_EXIT();
-    mp_int_t ret = wizchip_sendto(socket->fileno, (byte *)buf, len, ip, port);
+    mp_int_t ret = wizchip_sendto(sn, (byte *)buf, len, ip, port);
     MP_THREAD_GIL_ENTER();
 
     if (ret < 0) {
@@ -704,38 +868,113 @@ static mp_uint_t wiznet6k_socket_sendto(mod_network_socket_obj_t *socket, const 
 }
 
 static mp_uint_t wiznet6k_socket_recvfrom(mod_network_socket_obj_t *socket, byte *buf, mp_uint_t len, byte *ip, mp_uint_t *port, int *_errno) {
-    uint16_t port2;
-    MP_THREAD_GIL_EXIT();
-    mp_int_t ret = wizchip_recvfrom(socket->fileno, buf, len, ip, &port2);
-
-    MP_THREAD_GIL_ENTER();
-    *port = port2;
-    if (ret < 0) {
-        wiznet6k_socket_close(socket);
-        *_errno = -ret;
-        return -1;
+    mp_uint_t timeout_ms = WIZNET6K_TIMEOUT_BLOCKING;
+    if (socket->fileno >= 0 && (mp_uint_t)socket->fileno < _WIZCHIP_SOCK_NUM_) {
+        timeout_ms = wiznet6k_obj.socket_timeout_ms[socket->fileno];
     }
-    return ret;
+
+    mp_uint_t start = mp_hal_ticks_ms();
+
+    for (;;) {
+        uint8_t sn = (uint8_t)socket->fileno;
+        uint16_t rx_size = getSn_RX_RSR(sn);
+
+        if (rx_size > 0) {
+            uint16_t port2;
+            MP_THREAD_GIL_EXIT();
+            mp_int_t ret = wizchip_recvfrom(sn, buf, len, ip, &port2);
+            MP_THREAD_GIL_ENTER();
+            *port = port2;
+
+            if (ret > 0) {
+                return ret;
+            }
+
+            if (ret < 0) {
+                wiznet6k_socket_close(socket);
+                *_errno = -ret;
+                return -1;
+            }
+        }
+
+        // Non-blocking: return immediately
+        if (timeout_ms == 0) {
+            *_errno = MP_EAGAIN;
+            return -1;
+        }
+
+        // Software timeout check
+        if (timeout_ms != WIZNET6K_TIMEOUT_BLOCKING) {
+            if (mp_hal_ticks_ms() - start >= timeout_ms) {
+                *_errno = MP_ETIMEDOUT;
+                return -1;
+            }
+        }
+
+        mp_hal_delay_ms(1);
+    }
 }
 
 static int wiznet6k_socket_setsockopt(mod_network_socket_obj_t *socket, mp_uint_t level, mp_uint_t opt, const void *optval, mp_uint_t optlen, int *_errno) {
-    // TODO
-    *_errno = MP_EINVAL;
+    uint8_t sn = (uint8_t)socket->fileno;
+
+    if (level == MOD_NETWORK_SOL_SOCKET) {
+        switch (opt) {
+            case MOD_NETWORK_SO_REUSEADDR:
+                // WIZnet hardware TCP stack does not have TIME_WAIT state,
+                // so port reuse is always available. Just return success.
+                return 0;
+
+            case MOD_NETWORK_SO_BROADCAST:
+                // WIZnet allows broadcast by default in UDP mode.
+                // No register configuration needed, just return success.
+                return 0;
+
+            case MOD_NETWORK_SO_KEEPALIVE: {
+                if (optlen < sizeof(int)) {
+                    *_errno = MP_EINVAL;
+                    return -1;
+                }
+                int enable = *(const int *)optval;
+                // Sn_KPALVTR: 0 = disabled, non-zero = interval in 5s units
+                // Set to WIZNET6K_KEEPALIVE_INTVL (10s interval) when enabled
+                setSn_KPALVTR(sn, enable ? WIZNET6K_KEEPALIVE_INTVL : 0);
+                return 0;
+            }
+
+            case MOD_NETWORK_SO_SNDTIMEO:
+            case MOD_NETWORK_SO_RCVTIMEO: {
+                // Timeout in milliseconds, redirect to settimeout
+                if (optlen < sizeof(int)) {
+                    *_errno = MP_EINVAL;
+                    return -1;
+                }
+                int timeout_ms = *(const int *)optval;
+                wiznet6k_obj.socket_timeout_ms[sn] = (mp_uint_t)timeout_ms;
+                return 0;
+            }
+
+            default:
+                *_errno = MP_EOPNOTSUPP;
+                return -1;
+        }
+    }
+
+    *_errno = MP_EOPNOTSUPP;
     return -1;
 }
 
 static int wiznet6k_socket_settimeout(mod_network_socket_obj_t *socket, mp_uint_t timeout_ms, int *_errno) {
-    // TODO
-    *_errno = MP_EINVAL;
-    return -1;
+    (void)_errno;
 
-    /*
-    if (timeout_ms == 0) {
-        // set non-blocking mode
-        uint8_t arg = SOCK_IO_NONBLOCK;
-        wizchip_ctlsocket(socket->fileno, CS_SET_IOMODE, &arg);
+    socket->timeout = timeout_ms;
+
+    // Save timeout setting even before the underlying WIZnet socket is opened.
+    if (socket->fileno >= 0 && (mp_uint_t)socket->fileno < _WIZCHIP_SOCK_NUM_) {
+        wiznet6k_obj.socket_timeout_ms[socket->fileno] = timeout_ms;
     }
-    */
+
+    return 0;
 }
 
 static int wiznet6k_socket_ioctl(mod_network_socket_obj_t *socket, mp_uint_t request, mp_uint_t arg, int *_errno) {
@@ -865,6 +1104,9 @@ static mp_obj_t wiznet6k_make_new(const mp_obj_type_t *type, size_t n_args, size
     #else // WIZNET6K_PROVIDED_STACK
     wiznet6k_obj.active = false;
     wiznet6k_obj.socket_used = 0;
+    for (mp_uint_t i = 0; i < _WIZCHIP_SOCK_NUM_; ++i) {
+        wiznet6k_obj.socket_timeout_ms[i] = WIZNET6K_TIMEOUT_BLOCKING;
+    }
     #endif
 
     // Return wiznet6k object

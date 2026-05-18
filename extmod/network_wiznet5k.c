@@ -726,8 +726,8 @@ static mp_uint_t wiznet5k_socket_recv(mod_network_socket_obj_t *socket, byte *bu
         // Socket closed and no data left to read
         if ((sr == SOCK_CLOSED || sr == SOCK_CLOSE_WAIT) && rx_size == 0) {
             wiznet5k_socket_close(socket);
-            *_errno = MP_ENOTCONN;
-            return MP_STREAM_ERROR;
+            *_errno = 0;
+            return 0;
         }
 
         if (rx_size > 0) {

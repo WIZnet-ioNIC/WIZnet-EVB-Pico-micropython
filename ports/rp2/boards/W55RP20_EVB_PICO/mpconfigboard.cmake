@@ -6,6 +6,11 @@ set(MICROPY_PY_NETWORK 1)
 set(MICROPY_PY_LWIP 1)
 set(MICROPY_FROZEN_MANIFEST ${MICROPY_BOARD_DIR}/manifest.py)
 
+# Derive the unique ID from the full 128-bit flash unique ID, see board_unique_id.c.
+# The wrap is deferred because the firmware target doesn't exist yet at this point.
+set(MICROPY_SOURCE_BOARD ${MICROPY_BOARD_DIR}/board_unique_id.c)
+cmake_language(DEFER CALL target_link_options ${MICROPY_TARGET} PRIVATE "LINKER:--wrap=pico_get_unique_board_id")
+
 if(NOT DEFINED MICROPY_HW_FLASH_STORAGE_BYTES)
     set(MICROPY_HW_FLASH_STORAGE_BYTES 1441792)  # 1408 * 1024
 endif()
